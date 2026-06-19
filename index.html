@@ -1124,14 +1124,14 @@ select.input { background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www
     border-top:1px solid var(--border); z-index:100; padding-bottom:env(safe-area-inset-bottom);
   }
   .bottom-nav .nav-item {
-    flex:1; flex-direction:column; padding:10px 4px;
-    font-size:10px; gap:3px; justify-content:center; align-items:center;
-    color:var(--text-sub); border-radius:0;
+    flex:1; flex-direction:column; padding:8px 2px;
+    font-size:9px; gap:2px; justify-content:center; align-items:center;
+    color:var(--text-sub); border-radius:0; min-width:0;
   }
   .bottom-nav .nav-item.active { color:var(--accent); background:none; }
   .bottom-nav .nav-item.active::before { display:none; }
   .dash-hero-row { grid-template-columns:1fr; }
-  .dash-stats-row { grid-template-columns:1fr 1fr; }
+  .dash-stats-row { grid-template-columns:1fr; }
   .analytics-summary-row { grid-template-columns:1fr 1fr; }
   .summary-stats { grid-template-columns:1fr 1fr; }
   .cat-bar-label { min-width:80px; }

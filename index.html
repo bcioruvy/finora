@@ -1,0 +1,1230 @@
+<!-- Finora v1.1 -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Finora</title>
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-title" content="Finora" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="theme-color" content="#f7f7f5" media="(prefers-color-scheme: light)" />
+<meta name="theme-color" content="#0f0f0f" media="(prefers-color-scheme: dark)" />
+<script>
+  const _manifest = {
+    name: "Finora",
+    short_name: "Finora",
+    start_url: ".",
+    display: "standalone",
+    background_color: "#f7f7f5",
+    theme_color: "#4A6FA5",
+    icons: []
+  };
+  const _blob = new Blob([JSON.stringify(_manifest)], {type:"application/json"});
+  const _url = URL.createObjectURL(_blob);
+  const _link = document.createElement("link");
+  _link.rel = "manifest"; _link.href = _url;
+  document.head.appendChild(_link);
+</script>
+
+<!-- Firebase -->
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+import { getAuth, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, onAuthStateChanged, sendPasswordResetEmail, GoogleAuthProvider, signInWithPopup } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+import { getFirestore, collection, addDoc, getDocs, updateDoc, deleteDoc, doc, query, where, orderBy } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+
+// ── FIREBASE CONFIG ──────────────────────────────────────────────
+const firebaseConfig = {
+  apiKey: "YOUR_API_KEY",
+  authDomain: "YOUR_AUTH_DOMAIN",
+  projectId: "ledger-app-9ca93",
+  storageBucket: "YOUR_STORAGE_BUCKET",
+  messagingSenderId: "YOUR_MESSAGING_SENDER_ID",
+  appId: "YOUR_APP_ID"
+};
+// ────────────────────────────────────────────────────────────────
+
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const googleProvider = new GoogleAuthProvider();
+
+// ── STATE ────────────────────────────────────────────────────────
+let currentUser = null;
+let allTransactions = [];
+let allFavourites = [];
+let currentTab = "dashboard";
+let darkMode = localStorage.getItem("finora_dark") === "true";
+let monthlyBudget = parseFloat(localStorage.getItem("finora_budget") || "0");
+let categories = JSON.parse(localStorage.getItem("finora_categories") || '["Food","Transport","Utilities","Office Supplies","Entertainment","Other"]');
+let categoryBudgets = JSON.parse(localStorage.getItem("finora_cat_budgets") || "{}");
+let recurringTxns = JSON.parse(localStorage.getItem("finora_recurring") || "[]");
+let incomeSources = JSON.parse(localStorage.getItem("finora_sources") || '["Accounts Automated","Other"]');
+let editingId = null;
+let editingType = null;
+
+// ── HELPERS ──────────────────────────────────────────────────────
+function fmt(n) { return "Rs " + parseFloat(n || 0).toLocaleString("en-PK", {minimumFractionDigits: 0, maximumFractionDigits: 0}); }
+function fmtShort(n) { const v = parseFloat(n||0); if(v>=1000000) return "Rs "+(v/1000000).toFixed(1)+"M"; if(v>=1000) return "Rs "+(v/1000).toFixed(1)+"K"; return "Rs "+v.toFixed(0); }
+function getMonthKey(date) { const d = new Date(date); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}`; }
+function getMonthLabel(key) { const [y,m] = key.split("-"); return new Date(y, parseInt(m)-1, 1).toLocaleString("default",{month:"long",year:"numeric"}); }
+function currentMonthKey() { const n=new Date(); return `${n.getFullYear()}-${String(n.getMonth()+1).padStart(2,"0")}`; }
+function highlight(text, query) { if(!query) return text; const re = new RegExp(`(${query.replace(/[.*+?^${}()|[\]\\]/g,"\\$&")})`, "gi"); return String(text).replace(re, '<mark>$1</mark>'); }
+function showToast(msg, type="success") {
+  const t = document.getElementById("toast");
+  t.textContent = msg;
+  t.className = "toast show " + type;
+  setTimeout(() => t.className = "toast", 2800);
+}
+function showConfirm(msg, cb) {
+  document.getElementById("confirm-msg").textContent = msg;
+  document.getElementById("confirm-overlay").style.display = "flex";
+  document.getElementById("confirm-ok").onclick = () => { document.getElementById("confirm-overlay").style.display="none"; cb(); };
+  document.getElementById("confirm-cancel").onclick = () => { document.getElementById("confirm-overlay").style.display="none"; };
+}
+function applyTheme() {
+  document.documentElement.setAttribute("data-theme", darkMode ? "dark" : "light");
+  const toggle = document.getElementById("theme-toggle");
+  if(toggle) toggle.textContent = darkMode ? "Light Mode" : "Dark Mode";
+}
+
+// ── FIRESTORE CRUD ───────────────────────────────────────────────
+async function loadAll() {
+  if(!currentUser) return;
+  const q = query(collection(db,"ledger_transactions"), where("uid","==",currentUser.uid), orderBy("date","desc"));
+  const snap = await getDocs(q);
+  allTransactions = snap.docs.map(d => ({id:d.id,...d.data()}));
+
+  const q2 = query(collection(db,"ledger_favourites"), where("uid","==",currentUser.uid));
+  const snap2 = await getDocs(q2);
+  allFavourites = snap2.docs.map(d => ({id:d.id,...d.data()}));
+
+  checkRecurring();
+  renderCurrentTab();
+}
+
+async function addTransaction(data) {
+  data.uid = currentUser.uid;
+  data.createdAt = new Date().toISOString();
+  const ref = await addDoc(collection(db,"ledger_transactions"), data);
+  allTransactions.unshift({id:ref.id,...data});
+  allTransactions.sort((a,b)=>new Date(b.date)-new Date(a.date));
+  renderCurrentTab();
+  showToast("Entry saved.");
+}
+
+async function updateTransaction(id, data) {
+  await updateDoc(doc(db,"ledger_transactions",id), data);
+  const idx = allTransactions.findIndex(t=>t.id===id);
+  if(idx>-1) allTransactions[idx] = {...allTransactions[idx],...data};
+  allTransactions.sort((a,b)=>new Date(b.date)-new Date(a.date));
+  renderCurrentTab();
+  showToast("Entry updated.");
+}
+
+async function deleteTransaction(id) {
+  await deleteDoc(doc(db,"ledger_transactions",id));
+  allTransactions = allTransactions.filter(t=>t.id!==id);
+  renderCurrentTab();
+  showToast("Entry deleted.", "error");
+}
+
+async function saveFavourite(fav) {
+  fav.uid = currentUser.uid;
+  const ref = await addDoc(collection(db,"ledger_favourites"), fav);
+  allFavourites.push({id:ref.id,...fav});
+  renderCurrentTab();
+  showToast("Quick-log saved.");
+}
+
+async function deleteFavourite(id) {
+  await deleteDoc(doc(db,"ledger_favourites",id));
+  allFavourites = allFavourites.filter(f=>f.id!==id);
+  renderCurrentTab();
+  showToast("Quick-log removed.", "error");
+}
+
+// ── RECURRING ────────────────────────────────────────────────────
+function checkRecurring() {
+  const mk = currentMonthKey();
+  const done = JSON.parse(localStorage.getItem("finora_rec_done_"+mk) || "[]");
+  recurringTxns.forEach((r,i) => {
+    if(!done.includes(i)) {
+      const banner = document.getElementById("rec-banner");
+      if(banner) { banner.style.display="block"; return; }
+    }
+  });
+}
+
+// ── AUTH ─────────────────────────────────────────────────────────
+function showAuth() { document.getElementById("auth-screen").style.display="flex"; document.getElementById("app").style.display="none"; }
+function showApp() { document.getElementById("auth-screen").style.display="none"; document.getElementById("app").style.display="flex"; loadAll(); }
+
+function switchAuthTab(tab) {
+  document.getElementById("auth-signin").style.display = tab==="signin"?"block":"none";
+  document.getElementById("auth-register").style.display = tab==="register"?"block":"none";
+  document.querySelectorAll(".auth-tab-btn").forEach(b => b.classList.toggle("active", b.dataset.tab===tab));
+}
+
+window.handleSignIn = async function() {
+  const email = document.getElementById("si-email").value.trim();
+  const pass = document.getElementById("si-pass").value;
+  try {
+    await signInWithEmailAndPassword(auth, email, pass);
+  } catch(e) {
+    document.getElementById("si-error").textContent = friendlyError(e.code);
+  }
+};
+window.handleRegister = async function() {
+  const email = document.getElementById("reg-email").value.trim();
+  const pass = document.getElementById("reg-pass").value;
+  const confirm = document.getElementById("reg-confirm").value;
+  if(pass !== confirm) { document.getElementById("reg-error").textContent = "Passwords do not match."; return; }
+  try {
+    await createUserWithEmailAndPassword(auth, email, pass);
+  } catch(e) {
+    document.getElementById("reg-error").textContent = friendlyError(e.code);
+  }
+};
+window.handleGoogleSignIn = async function() {
+  try { await signInWithPopup(auth, googleProvider); }
+  catch(e) { document.getElementById("si-error").textContent = friendlyError(e.code); }
+};
+window.handleForgotPassword = async function() {
+  const email = document.getElementById("si-email").value.trim();
+  if(!email) { document.getElementById("si-error").textContent = "Enter your email above first."; return; }
+  try { await sendPasswordResetEmail(auth, email); showToast("Reset email sent."); }
+  catch(e) { document.getElementById("si-error").textContent = friendlyError(e.code); }
+};
+window.handleSignOut = function() {
+  showConfirm("Sign out of Finora?", () => signOut(auth));
+};
+function friendlyError(code) {
+  const map = {
+    "auth/invalid-email": "Invalid email address.",
+    "auth/user-not-found": "No account with that email.",
+    "auth/wrong-password": "Incorrect password.",
+    "auth/email-already-in-use": "Email already registered.",
+    "auth/weak-password": "Password must be at least 6 characters.",
+    "auth/popup-closed-by-user": "Sign-in cancelled.",
+    "auth/invalid-credential": "Incorrect email or password."
+  };
+  return map[code] || "Something went wrong. Try again.";
+}
+
+onAuthStateChanged(auth, user => {
+  currentUser = user;
+  if(user) { document.getElementById("user-email").textContent = user.email || user.displayName; showApp(); }
+  else showAuth();
+});
+
+// ── TAB NAVIGATION ───────────────────────────────────────────────
+function switchTab(tab) {
+  currentTab = tab;
+  document.querySelectorAll(".nav-item").forEach(el => el.classList.toggle("active", el.dataset.tab===tab));
+  renderCurrentTab();
+}
+window.switchTab = switchTab;
+
+function renderCurrentTab() {
+  const content = document.getElementById("tab-content");
+  switch(currentTab) {
+    case "dashboard": content.innerHTML = renderDashboard(); bindDashboard(); break;
+    case "expenses": content.innerHTML = renderExpenses(); bindExpenses(); break;
+    case "income": content.innerHTML = renderIncome(); bindIncome(); break;
+    case "analytics": content.innerHTML = renderAnalytics(); bindAnalytics(); break;
+    case "summary": content.innerHTML = renderSummary(); break;
+    case "settings": content.innerHTML = renderSettings(); bindSettings(); break;
+  }
+}
+
+// ── DASHBOARD ────────────────────────────────────────────────────
+function renderDashboard() {
+  const mk = currentMonthKey();
+  const expenses = allTransactions.filter(t=>t.type==="expense");
+  const income = allTransactions.filter(t=>t.type==="income");
+  const mExp = expenses.filter(t=>getMonthKey(t.date)===mk);
+  const mInc = income.filter(t=>getMonthKey(t.date)===mk);
+  const totalExp = expenses.reduce((s,t)=>s+parseFloat(t.amount||0),0);
+  const totalInc = income.reduce((s,t)=>s+parseFloat(t.amount||0),0);
+  const mExpTotal = mExp.reduce((s,t)=>s+parseFloat(t.amount||0),0);
+  const mIncTotal = mInc.reduce((s,t)=>s+parseFloat(t.amount||0),0);
+  const budgetPct = monthlyBudget ? Math.min(100,(mExpTotal/monthlyBudget)*100) : 0;
+  const budgetColor = budgetPct>=90?"var(--red)":budgetPct>=75?"var(--amber)":"var(--green)";
+  const netMonth = mIncTotal - mExpTotal;
+
+  // category alerts
+  const catTotals = {};
+  mExp.forEach(t=>{ catTotals[t.category]=(catTotals[t.category]||0)+parseFloat(t.amount||0); });
+  const alerts = Object.entries(categoryBudgets).filter(([cat,bud])=>{
+    return bud>0 && catTotals[cat] && (catTotals[cat]/bud)>=0.75;
+  });
+
+  // bar chart data (last 6 months)
+  const months = [];
+  for(let i=5;i>=0;i--) { const d=new Date(); d.setMonth(d.getMonth()-i); months.push(`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}`); }
+  const barData = months.map(m=>{
+    const e = expenses.filter(t=>getMonthKey(t.date)===m).reduce((s,t)=>s+parseFloat(t.amount||0),0);
+    const inc = income.filter(t=>getMonthKey(t.date)===m).reduce((s,t)=>s+parseFloat(t.amount||0),0);
+    return {m, e, inc};
+  });
+  const barMax = Math.max(...barData.map(b=>Math.max(b.e,b.inc)), monthlyBudget, 1);
+
+  // donut chart
+  const catEntries = Object.entries(catTotals).sort((a,b)=>b[1]-a[1]);
+  const donutSVG = buildDonut(catEntries, mExpTotal);
+
+  return `
+  <div class="dashboard">
+    <div class="dash-hero-row">
+      <div class="hero-card">
+        <div class="hero-label">This Month — Expenses</div>
+        <div class="hero-amount ${mExpTotal>monthlyBudget&&monthlyBudget>0?"over":""}">${fmt(mExpTotal)}</div>
+        ${monthlyBudget>0?`
+        <div class="budget-bar-wrap">
+          <div class="budget-bar" style="width:${budgetPct}%;background:${budgetColor}"></div>
+        </div>
+        <div class="budget-sub">${fmtShort(mExpTotal)} of ${fmtShort(monthlyBudget)} budget</div>
+        `:""}
+      </div>
+      <div class="hero-card">
+        <div class="hero-label">This Month — Income</div>
+        <div class="hero-amount positive">${fmt(mIncTotal)}</div>
+        <div class="hero-net ${netMonth>=0?"positive":"negative"}">Net: ${netMonth>=0?"+":""}${fmt(netMonth)}</div>
+      </div>
+    </div>
+
+    <div class="dash-stats-row">
+      <div class="stat-card"><div class="stat-label">All-time Expenses</div><div class="stat-val negative">${fmt(totalExp)}</div></div>
+      <div class="stat-card"><div class="stat-label">All-time Income</div><div class="stat-val positive">${fmt(totalInc)}</div></div>
+      <div class="stat-card"><div class="stat-label">All-time Net</div><div class="stat-val ${totalInc-totalExp>=0?"positive":"negative"}">${fmt(totalInc-totalExp)}</div></div>
+    </div>
+
+    ${alerts.length?`
+    <div class="section-title">Budget Alerts</div>
+    <div class="alerts-list">
+      ${alerts.map(([cat,bud])=>{
+        const spent = catTotals[cat]||0;
+        const pct = Math.min(100,(spent/bud)*100);
+        return `<div class="alert-item">
+          <div class="alert-row"><span class="alert-cat">${cat}</span><span class="alert-pct ${pct>=100?"over":""}">${pct.toFixed(0)}%</span></div>
+          <div class="budget-bar-wrap"><div class="budget-bar" style="width:${pct}%;background:${pct>=100?"var(--red)":"var(--amber)"}"></div></div>
+          <div class="alert-sub">${fmt(spent)} of ${fmt(bud)}</div>
+        </div>`;
+      }).join("")}
+    </div>`:""}
+
+    <div class="section-title">6-Month Overview</div>
+    <div class="bar-chart-wrap">
+      <div class="bar-chart">
+        ${barData.map(b=>{
+          const eH = (b.e/barMax)*100;
+          const iH = (b.inc/barMax)*100;
+          const bH = monthlyBudget?(Math.min(100,(monthlyBudget/barMax)*100)):0;
+          const label = new Date(b.m+"-01").toLocaleString("default",{month:"short"});
+          return `<div class="bar-group">
+            <div class="bars">
+              <div class="bar income-bar" style="height:${iH}%" title="Income: ${fmt(b.inc)}"></div>
+              <div class="bar expense-bar ${b.e>monthlyBudget&&monthlyBudget>0?"over":""}" style="height:${eH}%" title="Expenses: ${fmt(b.e)}"></div>
+              ${monthlyBudget?`<div class="budget-line" style="bottom:${bH}%"></div>`:""}
+            </div>
+            <div class="bar-label">${label}</div>
+          </div>`;
+        }).join("")}
+      </div>
+      <div class="bar-legend"><span class="legend-dot income-dot"></span>Income<span class="legend-dot expense-dot"></span>Expenses</div>
+    </div>
+
+    ${catEntries.length?`
+    <div class="section-title">This Month — By Category</div>
+    <div class="donut-wrap">${donutSVG}</div>`:""}
+  </div>`;
+}
+function bindDashboard() {}
+
+function buildDonut(entries, total) {
+  if(!entries.length||!total) return "";
+  const colors = ["#4A6FA5","#6B8FC9","#8FAFD8","#B5CCE8","#3A5A8A","#2A4A7A","#7A9FC0"];
+  let angle = -90;
+  const cx=100,cy=100,r=70,ri=45;
+  let paths = "";
+  let legend = "";
+  entries.slice(0,7).forEach(([cat,val],i)=>{
+    const pct = val/total;
+    const sweep = pct*360;
+    const a1 = angle*(Math.PI/180);
+    const a2 = (angle+sweep)*(Math.PI/180);
+    const x1=cx+r*Math.cos(a1), y1=cy+r*Math.sin(a1);
+    const x2=cx+r*Math.cos(a2), y2=cy+r*Math.sin(a2);
+    const ix1=cx+ri*Math.cos(a1), iy1=cy+ri*Math.sin(a1);
+    const ix2=cx+ri*Math.cos(a2), iy2=cy+ri*Math.sin(a2);
+    const lg = sweep>180?1:0;
+    const color = colors[i%colors.length];
+    const mid = (angle+sweep/2)*(Math.PI/180);
+    paths += `<path d="M ${ix1} ${iy1} L ${x1} ${y1} A ${r} ${r} 0 ${lg} 1 ${x2} ${y2} L ${ix2} ${iy2} A ${ri} ${ri} 0 ${lg} 0 ${ix1} ${iy1}" fill="${color}" opacity="0.92" filter="url(#dshadow)"/>`;
+    legend += `<div class="legend-row"><span class="legend-color" style="background:${color}"></span><span class="legend-cat">${cat}</span><span class="legend-pct">${(pct*100).toFixed(1)}%</span><span class="legend-amt">${fmt(val)}</span></div>`;
+    angle += sweep;
+  });
+  return `<svg viewBox="0 0 200 200" width="180" height="180">
+    <defs><filter id="dshadow"><feDropShadow dx="0" dy="2" stdDeviation="3" flood-opacity="0.18"/></filter></defs>
+    ${paths}
+    <text x="100" y="96" text-anchor="middle" class="donut-center-label">Total</text>
+    <text x="100" y="112" text-anchor="middle" class="donut-center-val">${fmtShort(total)}</text>
+  </svg>
+  <div class="donut-legend">${legend}</div>`;
+}
+
+// ── EXPENSES ─────────────────────────────────────────────────────
+function renderExpenses(searchQ="", monthF="") {
+  const favs = allFavourites.filter(f=>f.txnType==="expense");
+  let txns = allTransactions.filter(t=>t.type==="expense");
+  if(monthF) txns = txns.filter(t=>getMonthKey(t.date)===monthF);
+  if(searchQ) txns = txns.filter(t=> (t.category+t.note+t.amount).toLowerCase().includes(searchQ.toLowerCase()));
+  const total = txns.reduce((s,t)=>s+parseFloat(t.amount||0),0);
+
+  const months = [...new Set(allTransactions.filter(t=>t.type==="expense").map(t=>getMonthKey(t.date)))].sort().reverse();
+
+  return `
+  <div class="tab-header"><div class="tab-title">Expenses</div></div>
+
+  ${favs.length?`<div class="section-title">Quick-Log</div>
+  <div class="favs-list">
+    ${favs.map(f=>`<div class="fav-chip" onclick="applyFav('${f.id}','expense')">${f.label}<span class="fav-amt">${fmtShort(f.amount)}</span></div>`).join("")}
+  </div>`:""}
+
+  <div class="section-title">Add Expense</div>
+  <div class="form-card" id="exp-form">
+    <div class="form-row">
+      <input class="input" id="exp-amount" type="number" placeholder="Amount" min="0" />
+      <select class="input" id="exp-category">
+        ${categories.map(c=>`<option>${c}</option>`).join("")}
+      </select>
+    </div>
+    <div class="form-row"><input class="input" id="exp-note" type="text" placeholder="Note (optional)" /></div>
+    <div class="form-row">
+      <input class="input" id="exp-date" type="date" value="${new Date().toISOString().slice(0,10)}" />
+      <select class="input" id="exp-method">
+        <option>Bank</option><option>Cash</option>
+      </select>
+    </div>
+    <div class="form-actions">
+      <button class="btn-ghost" onclick="saveFavFromExpense()">Save as Quick-Log</button>
+      <button class="btn-primary" onclick="submitExpense()">Add Expense</button>
+    </div>
+  </div>
+
+  <div class="section-title">
+    <span>${monthF?getMonthLabel(monthF):"All Months"} — ${fmt(total)}</span>
+  </div>
+  <div class="filter-row">
+    <input class="input search-input" id="exp-search" type="text" placeholder="Search..." value="${searchQ}" oninput="filterExpenses()" />
+    <select class="input" id="exp-month" onchange="filterExpenses()">
+      <option value="">All Months</option>
+      ${months.map(m=>`<option value="${m}" ${m===monthF?"selected":""}>${getMonthLabel(m)}</option>`).join("")}
+    </select>
+  </div>
+
+  <div class="txn-list">
+    ${txns.length ? txns.map(t=>txnRow(t,searchQ,"expense")).join("") : `<div class="empty">No expenses found.</div>`}
+  </div>`;
+}
+
+function bindExpenses() {
+  window.filterExpenses = function() {
+    const q = document.getElementById("exp-search")?.value||"";
+    const m = document.getElementById("exp-month")?.value||"";
+    document.getElementById("tab-content").innerHTML = renderExpenses(q,m);
+    bindExpenses();
+  };
+  window.submitExpense = async function() {
+    const amount = parseFloat(document.getElementById("exp-amount")?.value);
+    const category = document.getElementById("exp-category")?.value;
+    const note = document.getElementById("exp-note")?.value.trim();
+    const date = document.getElementById("exp-date")?.value;
+    const method = document.getElementById("exp-method")?.value;
+    if(!amount||!date) { showToast("Amount and date required.","error"); return; }
+    if(editingId && editingType==="expense") {
+      await updateTransaction(editingId,{amount,category,note,date,method});
+      editingId=null; editingType=null;
+    } else {
+      await addTransaction({type:"expense",amount,category,note,date,method});
+    }
+  };
+  window.saveFavFromExpense = async function() {
+    const amount = parseFloat(document.getElementById("exp-amount")?.value);
+    const category = document.getElementById("exp-category")?.value;
+    const note = document.getElementById("exp-note")?.value.trim();
+    if(!amount) { showToast("Enter an amount first.","error"); return; }
+    const label = note||category;
+    await saveFavourite({txnType:"expense",amount,category,note,label});
+  };
+  window.applyFav = function(id, type) {
+    const f = allFavourites.find(x=>x.id===id);
+    if(!f) return;
+    if(type==="expense") {
+      document.getElementById("exp-amount").value=f.amount;
+      const cat = document.getElementById("exp-category");
+      if(cat) [...cat.options].forEach(o=>{ o.selected=o.value===f.category; });
+      document.getElementById("exp-note").value=f.note||"";
+    }
+  };
+  window.editTxn = function(id) {
+    const t = allTransactions.find(x=>x.id===id);
+    if(!t) return;
+    editingId=id; editingType=t.type;
+    if(t.type==="expense") {
+      document.getElementById("exp-amount").value=t.amount;
+      const cat=document.getElementById("exp-category");
+      if(cat) [...cat.options].forEach(o=>{ o.selected=o.value===t.category; });
+      document.getElementById("exp-note").value=t.note||"";
+      document.getElementById("exp-date").value=t.date;
+      const meth=document.getElementById("exp-method");
+      if(meth) [...meth.options].forEach(o=>{ o.selected=o.value===t.method; });
+      document.getElementById("exp-amount").focus();
+    }
+  };
+  window.deleteTxn = function(id) {
+    showConfirm("Delete this entry?", ()=>deleteTransaction(id));
+  };
+  window.deleteFav = function(id) {
+    showConfirm("Remove this quick-log?", ()=>deleteFavourite(id));
+  };
+}
+
+function txnRow(t, q, type) {
+  const d = new Date(t.date);
+  const dateStr = d.toLocaleDateString("en-PK",{day:"numeric",month:"short"});
+  const isExp = type==="expense";
+  return `<div class="txn-row">
+    <div class="txn-left">
+      <div class="txn-main">${highlight(isExp?t.category:t.source, q)}</div>
+      <div class="txn-sub">${highlight(t.note||"", q)} <span class="txn-method">${t.method||""}</span></div>
+    </div>
+    <div class="txn-right">
+      <div class="txn-amount ${isExp?"negative":"positive"}">${isExp?"-":"+"} ${fmt(t.amount)}</div>
+      <div class="txn-date">${dateStr}</div>
+      <div class="txn-actions">
+        <button class="btn-icon" onclick="editTxn('${t.id}')">Edit</button>
+        <button class="btn-icon red" onclick="deleteTxn('${t.id}')">Delete</button>
+      </div>
+    </div>
+  </div>`;
+}
+
+// ── INCOME ───────────────────────────────────────────────────────
+function renderIncome(searchQ="", monthF="") {
+  const favs = allFavourites.filter(f=>f.txnType==="income");
+  let txns = allTransactions.filter(t=>t.type==="income");
+  if(monthF) txns = txns.filter(t=>getMonthKey(t.date)===monthF);
+  if(searchQ) txns = txns.filter(t=> (t.source+t.note+t.amount+t.tag).toLowerCase().includes(searchQ.toLowerCase()));
+  const total = txns.reduce((s,t)=>s+parseFloat(t.amount||0),0);
+  const months = [...new Set(allTransactions.filter(t=>t.type==="income").map(t=>getMonthKey(t.date)))].sort().reverse();
+
+  return `
+  <div class="tab-header"><div class="tab-title">Income</div></div>
+
+  ${favs.length?`<div class="section-title">Quick-Log</div>
+  <div class="favs-list">
+    ${favs.map(f=>`<div class="fav-chip" onclick="applyIncFav('${f.id}')">${f.label}<span class="fav-amt">${fmtShort(f.amount)}</span></div>`).join("")}
+  </div>`:""}
+
+  <div class="section-title">Add Income</div>
+  <div class="form-card">
+    <div class="form-row">
+      <input class="input" id="inc-amount" type="number" placeholder="Amount" min="0" />
+      <select class="input" id="inc-source">
+        ${incomeSources.map(s=>`<option>${s}</option>`).join("")}
+      </select>
+    </div>
+    <div class="form-row">
+      <select class="input" id="inc-tag">
+        <option>Salary</option><option>Client Payment</option><option>Reimbursement</option><option>Other</option>
+      </select>
+      <input class="input" id="inc-date" type="date" value="${new Date().toISOString().slice(0,10)}" />
+    </div>
+    <div class="form-row"><input class="input" id="inc-note" type="text" placeholder="Note (optional)" /></div>
+    <div class="form-actions">
+      <button class="btn-ghost" onclick="saveFavFromIncome()">Save as Quick-Log</button>
+      <button class="btn-primary" onclick="submitIncome()">Add Income</button>
+    </div>
+  </div>
+
+  <div class="section-title">
+    <span>${monthF?getMonthLabel(monthF):"All Months"} — ${fmt(total)}</span>
+  </div>
+  <div class="filter-row">
+    <input class="input search-input" id="inc-search" type="text" placeholder="Search..." value="${searchQ}" oninput="filterIncome()" />
+    <select class="input" id="inc-month" onchange="filterIncome()">
+      <option value="">All Months</option>
+      ${months.map(m=>`<option value="${m}" ${m===monthF?"selected":""}>${getMonthLabel(m)}</option>`).join("")}
+    </select>
+  </div>
+
+  <div class="txn-list">
+    ${txns.length ? txns.map(t=>txnRow(t,searchQ,"income")).join("") : `<div class="empty">No income entries found.</div>`}
+  </div>`;
+}
+
+function bindIncome() {
+  window.filterIncome = function() {
+    const q = document.getElementById("inc-search")?.value||"";
+    const m = document.getElementById("inc-month")?.value||"";
+    document.getElementById("tab-content").innerHTML = renderIncome(q,m);
+    bindIncome();
+  };
+  window.submitIncome = async function() {
+    const amount = parseFloat(document.getElementById("inc-amount")?.value);
+    const source = document.getElementById("inc-source")?.value;
+    const tag = document.getElementById("inc-tag")?.value;
+    const note = document.getElementById("inc-note")?.value.trim();
+    const date = document.getElementById("inc-date")?.value;
+    if(!amount||!date) { showToast("Amount and date required.","error"); return; }
+    if(editingId && editingType==="income") {
+      await updateTransaction(editingId,{amount,source,tag,note,date});
+      editingId=null; editingType=null;
+    } else {
+      await addTransaction({type:"income",amount,source,tag,note,date});
+    }
+  };
+  window.saveFavFromIncome = async function() {
+    const amount = parseFloat(document.getElementById("inc-amount")?.value);
+    const source = document.getElementById("inc-source")?.value;
+    const note = document.getElementById("inc-note")?.value.trim();
+    if(!amount) { showToast("Enter an amount first.","error"); return; }
+    await saveFavourite({txnType:"income",amount,source,note,label:source});
+  };
+  window.applyIncFav = function(id) {
+    const f = allFavourites.find(x=>x.id===id);
+    if(!f) return;
+    document.getElementById("inc-amount").value=f.amount;
+    const src=document.getElementById("inc-source");
+    if(src) [...src.options].forEach(o=>{ o.selected=o.value===f.source; });
+    document.getElementById("inc-note").value=f.note||"";
+  };
+  window.editTxn = function(id) {
+    const t = allTransactions.find(x=>x.id===id);
+    if(!t||t.type!=="income") return;
+    editingId=id; editingType="income";
+    document.getElementById("inc-amount").value=t.amount;
+    const src=document.getElementById("inc-source");
+    if(src) [...src.options].forEach(o=>{ o.selected=o.value===t.source; });
+    const tag=document.getElementById("inc-tag");
+    if(tag) [...tag.options].forEach(o=>{ o.selected=o.value===t.tag; });
+    document.getElementById("inc-note").value=t.note||"";
+    document.getElementById("inc-date").value=t.date;
+    document.getElementById("inc-amount").focus();
+  };
+  window.deleteTxn = function(id) {
+    showConfirm("Delete this entry?", ()=>deleteTransaction(id));
+  };
+}
+
+// ── ANALYTICS ────────────────────────────────────────────────────
+function renderAnalytics(selMonth) {
+  if(!selMonth) selMonth = currentMonthKey();
+  const months = [...new Set(allTransactions.map(t=>getMonthKey(t.date)))].sort().reverse();
+  const mExp = allTransactions.filter(t=>t.type==="expense"&&getMonthKey(t.date)===selMonth);
+  const mInc = allTransactions.filter(t=>t.type==="income"&&getMonthKey(t.date)===selMonth);
+  const totalExp = mExp.reduce((s,t)=>s+parseFloat(t.amount||0),0);
+  const totalInc = mInc.reduce((s,t)=>s+parseFloat(t.amount||0),0);
+
+  // category breakdown
+  const catTotals = {};
+  mExp.forEach(t=>{ catTotals[t.category]=(catTotals[t.category]||0)+parseFloat(t.amount||0); });
+  const catEntries = Object.entries(catTotals).sort((a,b)=>b[1]-a[1]);
+  const barMax = Math.max(...catEntries.map(c=>c[1]),monthlyBudget||0,1);
+
+  const donutSVG = buildDonut(catEntries, totalExp);
+
+  return `
+  <div class="tab-header"><div class="tab-title">Analytics</div></div>
+  <div class="filter-row">
+    <select class="input" id="ana-month" onchange="changeAnalyticsMonth()">
+      ${months.map(m=>`<option value="${m}" ${m===selMonth?"selected":""}>${getMonthLabel(m)}</option>`).join("")}
+    </select>
+  </div>
+
+  <div class="analytics-summary-row">
+    <div class="stat-card"><div class="stat-label">Expenses</div><div class="stat-val negative">${fmt(totalExp)}</div></div>
+    <div class="stat-card"><div class="stat-label">Income</div><div class="stat-val positive">${fmt(totalInc)}</div></div>
+    <div class="stat-card"><div class="stat-label">Net</div><div class="stat-val ${totalInc-totalExp>=0?"positive":"negative"}">${fmt(totalInc-totalExp)}</div></div>
+  </div>
+
+  ${monthlyBudget?`
+  <div class="section-title">Budget vs Actual</div>
+  <div class="ana-budget-row">
+    <div class="ana-budget-bar-wrap">
+      <div class="ana-budget-bar ${totalExp>monthlyBudget?"over":""}" style="width:${Math.min(100,(totalExp/monthlyBudget)*100)}%"></div>
+    </div>
+    <div class="ana-budget-label">${fmt(totalExp)} of ${fmt(monthlyBudget)}</div>
+  </div>`:""}
+
+  <div class="section-title">By Category</div>
+  ${catEntries.length?`
+  <div class="cat-bars">
+    ${catEntries.map(([cat,val])=>{
+      const pct = (val/barMax)*100;
+      const budPct = categoryBudgets[cat]?Math.min(100,(val/categoryBudgets[cat])*100):null;
+      return `<div class="cat-bar-row">
+        <div class="cat-bar-label">${cat}</div>
+        <div class="cat-bar-track"><div class="cat-bar-fill ${budPct>=100?"over":budPct>=75?"warn":""}" style="width:${pct}%"></div></div>
+        <div class="cat-bar-amt">${fmt(val)}</div>
+      </div>`;
+    }).join("")}
+  </div>
+  <div class="donut-wrap">${donutSVG}</div>
+  `:`<div class="empty">No expense data for this month.</div>`}`;
+}
+
+function bindAnalytics() {
+  window.changeAnalyticsMonth = function() {
+    const m = document.getElementById("ana-month")?.value;
+    document.getElementById("tab-content").innerHTML = renderAnalytics(m);
+    bindAnalytics();
+  };
+}
+
+// ── SUMMARY ──────────────────────────────────────────────────────
+function renderSummary() {
+  const months = [...new Set(allTransactions.map(t=>getMonthKey(t.date)))].sort().reverse();
+  if(!months.length) return `<div class="tab-header"><div class="tab-title">Monthly Summary</div></div><div class="empty">No data yet.</div>`;
+
+  return `
+  <div class="tab-header"><div class="tab-title">Monthly Summary</div></div>
+  <div class="summary-list">
+    ${months.map(m=>{
+      const exp = allTransactions.filter(t=>t.type==="expense"&&getMonthKey(t.date)===m).reduce((s,t)=>s+parseFloat(t.amount||0),0);
+      const inc = allTransactions.filter(t=>t.type==="income"&&getMonthKey(t.date)===m).reduce((s,t)=>s+parseFloat(t.amount||0),0);
+      const net = inc - exp;
+      const budPct = monthlyBudget?Math.min(100,(exp/monthlyBudget)*100):0;
+      const budColor = budPct>=90?"var(--red)":budPct>=75?"var(--amber)":"var(--green)";
+      return `<div class="summary-card">
+        <div class="summary-month">${getMonthLabel(m)}</div>
+        <div class="summary-stats">
+          <div><span class="summary-label">Expenses</span><span class="negative">${fmt(exp)}</span></div>
+          <div><span class="summary-label">Income</span><span class="positive">${fmt(inc)}</span></div>
+          <div><span class="summary-label">Net</span><span class="${net>=0?"positive":"negative"}">${fmt(net)}</span></div>
+        </div>
+        ${monthlyBudget?`<div class="budget-bar-wrap" style="margin-top:10px"><div class="budget-bar" style="width:${budPct}%;background:${budColor}"></div></div>`:""}
+      </div>`;
+    }).join("")}
+  </div>`;
+}
+
+// ── SETTINGS ─────────────────────────────────────────────────────
+function renderSettings() {
+  const mk = currentMonthKey();
+  const done = JSON.parse(localStorage.getItem("finora_rec_done_"+mk)||"[]");
+  return `
+  <div class="tab-header"><div class="tab-title">Settings</div></div>
+
+  <div class="settings-section">
+    <div class="settings-label">Monthly Budget</div>
+    <div class="form-row">
+      <input class="input" id="set-budget" type="number" value="${monthlyBudget||""}" placeholder="e.g. 50000" />
+      <button class="btn-primary" onclick="saveBudget()">Save</button>
+    </div>
+  </div>
+
+  <div class="settings-section">
+    <div class="settings-label">Expense Categories</div>
+    <div class="tag-list" id="cat-list">
+      ${categories.map((c,i)=>`<div class="tag-item">${c}<button class="tag-remove" onclick="removeCategory(${i})">×</button></div>`).join("")}
+    </div>
+    <div class="form-row">
+      <input class="input" id="new-cat" placeholder="New category" />
+      <button class="btn-primary" onclick="addCategory()">Add</button>
+    </div>
+  </div>
+
+  <div class="settings-section">
+    <div class="settings-label">Category Budget Limits</div>
+    ${categories.map(c=>`<div class="form-row catbud-row">
+      <span class="catbud-label">${c}</span>
+      <input class="input" data-cat="${c}" type="number" placeholder="Limit" value="${categoryBudgets[c]||""}" oninput="updateCatBudget(this)" />
+    </div>`).join("")}
+  </div>
+
+  <div class="settings-section">
+    <div class="settings-label">Income Sources</div>
+    <div class="tag-list">
+      ${incomeSources.map((s,i)=>`<div class="tag-item">${s}<button class="tag-remove" onclick="removeSource(${i})">×</button></div>`).join("")}
+    </div>
+    <div class="form-row">
+      <input class="input" id="new-source" placeholder="New source" />
+      <button class="btn-primary" onclick="addSource()">Add</button>
+    </div>
+  </div>
+
+  <div class="settings-section">
+    <div class="settings-label">Recurring Transactions</div>
+    ${recurringTxns.map((r,i)=>`<div class="rec-item">
+      <span>${r.label} — ${fmt(r.amount)} (${r.txnType})</span>
+      <div class="rec-actions">
+        ${!done.includes(i)?`<button class="btn-ghost small" onclick="confirmRecurring(${i})">Log this month</button>`:`<span class="rec-done">Logged</span>`}
+        <button class="btn-icon red" onclick="removeRecurring(${i})">Remove</button>
+      </div>
+    </div>`).join("")}
+    <div class="section-title" style="margin-top:12px">Add Recurring</div>
+    <div class="form-row">
+      <input class="input" id="rec-label" placeholder="Label" />
+      <input class="input" id="rec-amount" type="number" placeholder="Amount" />
+    </div>
+    <div class="form-row">
+      <select class="input" id="rec-type"><option value="expense">Expense</option><option value="income">Income</option></select>
+      <select class="input" id="rec-cat">${categories.map(c=>`<option>${c}</option>`).join("")}</select>
+    </div>
+    <button class="btn-primary" onclick="addRecurring()">Add Recurring</button>
+  </div>
+
+  <div class="settings-section">
+    <div class="settings-label">Export CSV</div>
+    <div class="form-row">
+      <button class="btn-ghost" onclick="exportCSV('expense')">Export Expenses</button>
+      <button class="btn-ghost" onclick="exportCSV('income')">Export Income</button>
+    </div>
+  </div>
+
+  <div class="settings-section">
+    <div class="settings-label">Account</div>
+    <div class="account-info">${currentUser?.email||currentUser?.displayName||""}</div>
+    <button class="btn-ghost full-width" style="color:var(--red)" onclick="handleSignOut()">Sign Out</button>
+  </div>`;
+}
+
+function bindSettings() {
+  window.toggleTheme = function() { darkMode=!darkMode; localStorage.setItem("finora_dark",darkMode); applyTheme(); renderCurrentTab(); };
+  window.saveBudget = function() { monthlyBudget=parseFloat(document.getElementById("set-budget")?.value||0); localStorage.setItem("finora_budget",monthlyBudget); showToast("Budget saved."); };
+  window.addCategory = function() { const v=document.getElementById("new-cat")?.value.trim(); if(!v||categories.includes(v)) return; categories.push(v); localStorage.setItem("finora_categories",JSON.stringify(categories)); renderCurrentTab(); };
+  window.removeCategory = function(i) { categories.splice(i,1); localStorage.setItem("finora_categories",JSON.stringify(categories)); renderCurrentTab(); };
+  window.addSource = function() { const v=document.getElementById("new-source")?.value.trim(); if(!v||incomeSources.includes(v)) return; incomeSources.push(v); localStorage.setItem("finora_sources",JSON.stringify(incomeSources)); renderCurrentTab(); };
+  window.removeSource = function(i) { incomeSources.splice(i,1); localStorage.setItem("finora_sources",JSON.stringify(incomeSources)); renderCurrentTab(); };
+  window.updateCatBudget = function(el) { const cat=el.dataset.cat; categoryBudgets[cat]=parseFloat(el.value||0); localStorage.setItem("finora_cat_budgets",JSON.stringify(categoryBudgets)); };
+  window.addRecurring = function() {
+    const label=document.getElementById("rec-label")?.value.trim();
+    const amount=parseFloat(document.getElementById("rec-amount")?.value);
+    const txnType=document.getElementById("rec-type")?.value;
+    const category=document.getElementById("rec-cat")?.value;
+    if(!label||!amount) { showToast("Label and amount required.","error"); return; }
+    recurringTxns.push({label,amount,txnType,category});
+    localStorage.setItem("finora_recurring",JSON.stringify(recurringTxns));
+    renderCurrentTab();
+  };
+  window.removeRecurring = function(i) { recurringTxns.splice(i,1); localStorage.setItem("finora_recurring",JSON.stringify(recurringTxns)); renderCurrentTab(); };
+  window.confirmRecurring = async function(i) {
+    const r = recurringTxns[i];
+    const mk = currentMonthKey();
+    const done = JSON.parse(localStorage.getItem("finora_rec_done_"+mk)||"[]");
+    if(done.includes(i)) return;
+    const date = mk+"-01";
+    await addTransaction({type:r.txnType,amount:r.amount,category:r.category||"",source:r.label||"",note:"Recurring: "+r.label,date,method:"Bank"});
+    done.push(i);
+    localStorage.setItem("finora_rec_done_"+mk,JSON.stringify(done));
+    renderCurrentTab();
+  };
+  window.exportCSV = function(type) {
+    const txns = allTransactions.filter(t=>t.type===type);
+    const headers = type==="expense"?["Date","Category","Note","Amount","Method"]:["Date","Source","Tag","Note","Amount"];
+    const rows = txns.map(t=>type==="expense"?[t.date,t.category,t.note||"",t.amount,t.method||""]:[ t.date,t.source,t.tag||"",t.note||"",t.amount]);
+    const csv = [headers,...rows].map(r=>r.map(v=>`"${v}"`).join(",")).join("\n");
+    const blob = new Blob([csv],{type:"text/csv"});
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `finora_${type}_${new Date().toISOString().slice(0,10)}.csv`;
+    a.click();
+  };
+}
+
+// ── INIT ─────────────────────────────────────────────────────────
+applyTheme();
+</script>
+
+<style>
+/* ── TOKENS ───────────────────────────────────── */
+:root {
+  --accent: #4A6FA5;
+  --accent-hover: #3a5f95;
+  --accent-soft: rgba(74,111,165,0.12);
+  --green: #2e7d52;
+  --red: #b94040;
+  --amber: #c07a20;
+  --radius: 10px;
+  --sidebar-w: 220px;
+  --transition: 0.2s ease;
+}
+[data-theme="light"] {
+  --bg: #f7f7f5;
+  --surface: #ffffff;
+  --surface2: #f0f0ee;
+  --border: #e4e4e0;
+  --text: #1a1a1a;
+  --text-sub: #6b6b6b;
+  --sidebar-bg: #1e2535;
+  --sidebar-text: rgba(255,255,255,0.72);
+  --sidebar-active: #ffffff;
+  --sidebar-active-bg: rgba(255,255,255,0.1);
+  --nav-bg: rgba(247,247,245,0.85);
+}
+[data-theme="dark"] {
+  --bg: #0f0f0f;
+  --surface: #1a1a1a;
+  --surface2: #222222;
+  --border: #2e2e2e;
+  --text: #f0f0ee;
+  --text-sub: #888888;
+  --sidebar-bg: #111520;
+  --sidebar-text: rgba(255,255,255,0.6);
+  --sidebar-active: #ffffff;
+  --sidebar-active-bg: rgba(255,255,255,0.08);
+  --nav-bg: rgba(15,15,15,0.88);
+  --accent-soft: rgba(74,111,165,0.18);
+}
+
+/* ── RESET ────────────────────────────────────── */
+*,*::before,*::after { box-sizing:border-box; margin:0; padding:0; }
+html,body { height:100%; }
+body { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:var(--bg); color:var(--text); font-size:15px; line-height:1.5; -webkit-font-smoothing:antialiased; transition:background 0.3s, color 0.3s; }
+button { cursor:pointer; border:none; background:none; font-family:inherit; font-size:inherit; }
+input,select { font-family:inherit; font-size:inherit; }
+mark { background:rgba(74,111,165,0.25); color:inherit; border-radius:2px; }
+
+/* ── AUTH ─────────────────────────────────────── */
+#auth-screen {
+  display:flex; align-items:center; justify-content:center;
+  min-height:100vh; background:var(--bg); padding:24px;
+  transition:background 0.3s;
+}
+.auth-card {
+  background:var(--surface); border:1px solid var(--border);
+  border-radius:16px; padding:40px 36px; width:100%; max-width:400px;
+  transition:background 0.3s;
+}
+.auth-logo { font-size:22px; font-weight:700; letter-spacing:-0.5px; color:var(--accent); margin-bottom:6px; }
+.auth-tagline { font-size:13px; color:var(--text-sub); margin-bottom:28px; }
+.auth-tabs { display:flex; gap:0; margin-bottom:24px; border:1px solid var(--border); border-radius:8px; overflow:hidden; }
+.auth-tab-btn { flex:1; padding:9px; font-size:14px; font-weight:500; color:var(--text-sub); background:transparent; transition:all var(--transition); }
+.auth-tab-btn.active { background:var(--accent); color:#fff; }
+.form-group { margin-bottom:14px; }
+.form-group label { display:block; font-size:13px; color:var(--text-sub); margin-bottom:5px; }
+.input {
+  width:100%; padding:10px 12px; border:1px solid var(--border);
+  border-radius:var(--radius); background:var(--surface2); color:var(--text);
+  font-size:14px; outline:none; transition:border-color var(--transition), background 0.3s;
+  -webkit-appearance:none; appearance:none;
+}
+.input:focus { border-color:var(--accent); }
+select.input { background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%236b6b6b' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E"); background-repeat:no-repeat; background-position:right 10px center; padding-right:30px; }
+.btn-primary { width:100%; padding:11px; background:var(--accent); color:#fff; border-radius:var(--radius); font-weight:600; font-size:14px; transition:background var(--transition); }
+.btn-primary:hover { background:var(--accent-hover); }
+.auth-error { font-size:13px; color:var(--red); margin-top:6px; min-height:18px; }
+.auth-divider { text-align:center; color:var(--text-sub); font-size:13px; margin:16px 0; position:relative; }
+.auth-divider::before,.auth-divider::after { content:""; position:absolute; top:50%; width:42%; height:1px; background:var(--border); }
+.auth-divider::before { left:0; } .auth-divider::after { right:0; }
+.btn-google { width:100%; padding:10px; border:1px solid var(--border); border-radius:var(--radius); color:var(--text); background:var(--surface2); font-weight:500; font-size:14px; transition:all var(--transition); }
+.btn-google:hover { border-color:var(--accent); }
+.auth-forgot { font-size:13px; color:var(--accent); cursor:pointer; text-align:right; margin-top:8px; display:block; background:none; border:none; font-family:inherit; }
+
+/* ── APP SHELL ────────────────────────────────── */
+#app { display:none; height:100vh; overflow:hidden; width:100%; }
+
+/* SIDEBAR (iPad/Desktop) */
+.sidebar {
+  position:fixed; left:0; top:0; bottom:0; width:var(--sidebar-w);
+  background:var(--sidebar-bg); display:flex; flex-direction:column;
+  z-index:100; padding:0 0 24px;
+}
+.sidebar-brand { padding:28px 24px 20px; }
+.sidebar-logo { font-size:20px; font-weight:700; letter-spacing:-0.5px; color:#fff; }
+.sidebar-sub { font-size:11px; color:rgba(255,255,255,0.4); margin-top:2px; letter-spacing:0.5px; text-transform:uppercase; }
+.sidebar-nav { flex:1; padding:0 12px; display:flex; flex-direction:column; gap:2px; }
+.nav-item {
+  display:flex; align-items:center; padding:10px 12px;
+  border-radius:8px; color:var(--sidebar-text); font-size:14px; font-weight:500;
+  cursor:pointer; transition:all var(--transition); gap:10px; border:none; background:none; font-family:inherit; width:100%; text-align:left;
+}
+.nav-item:hover { background:rgba(255,255,255,0.06); color:rgba(255,255,255,0.9); }
+.nav-item.active { background:var(--sidebar-active-bg); color:var(--sidebar-active); }
+.nav-item.active::before { content:""; width:3px; height:16px; background:var(--accent); border-radius:2px; margin-right:2px; }
+.sidebar-user { padding:0 20px; font-size:12px; color:rgba(255,255,255,0.35); word-break:break-all; }
+
+/* MAIN CONTENT */
+.main-content {
+  margin-left:var(--sidebar-w);
+  height:100vh; overflow-y:auto;
+  padding:28px 32px 40px;
+  background:var(--bg);
+  width:calc(100% - var(--sidebar-w));
+}
+#tab-content { max-width:100%; }
+
+/* BOTTOM NAV (Mobile) */
+.bottom-nav { display:none; }
+
+/* ── COMPONENTS ───────────────────────────────── */
+.tab-header { margin-bottom:24px; }
+.tab-title { font-size:24px; font-weight:700; letter-spacing:-0.5px; }
+.section-title { font-size:12px; font-weight:600; letter-spacing:0.6px; text-transform:uppercase; color:var(--text-sub); margin:20px 0 10px; }
+.form-card { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:18px; margin-bottom:4px; }
+.form-row { display:flex; gap:10px; margin-bottom:10px; }
+.form-row .input { flex:1; }
+.form-row:last-child { margin-bottom:0; }
+.form-row.catbud-row { align-items:center; margin-bottom:8px; }
+.catbud-label { min-width:110px; font-size:14px; color:var(--text-sub); }
+.form-actions { display:flex; gap:10px; justify-content:flex-end; margin-top:12px; }
+.btn-ghost { padding:9px 16px; border:1px solid var(--border); border-radius:var(--radius); color:var(--text); font-size:14px; font-weight:500; transition:all var(--transition); }
+.btn-ghost:hover { border-color:var(--accent); color:var(--accent); }
+.btn-ghost.full-width { width:100%; }
+.btn-ghost.small { padding:5px 10px; font-size:13px; }
+.btn-icon { padding:4px 10px; font-size:12px; color:var(--text-sub); border:1px solid var(--border); border-radius:6px; transition:all var(--transition); }
+.btn-icon:hover { border-color:var(--accent); color:var(--accent); }
+.btn-icon.red { color:var(--red); border-color:transparent; }
+.btn-icon.red:hover { border-color:var(--red); }
+.form-row .btn-primary { flex:0 0 auto; width:auto; padding:10px 20px; }
+.filter-row .input { flex:1; }
+.search-input { max-width:260px; }
+
+/* TRANSACTION LIST */
+.txn-list { display:flex; flex-direction:column; gap:0; }
+.txn-row {
+  display:flex; justify-content:space-between; align-items:center;
+  padding:14px 0; border-bottom:1px solid var(--border); gap:12px;
+}
+.txn-row:last-child { border-bottom:none; }
+.txn-left { flex:1; min-width:0; }
+.txn-main { font-size:15px; font-weight:500; color:var(--text); }
+.txn-sub { font-size:13px; color:var(--text-sub); margin-top:2px; }
+.txn-method { font-size:12px; color:var(--text-sub); opacity:0.7; }
+.txn-right { text-align:right; flex-shrink:0; }
+.txn-amount { font-size:15px; font-weight:600; }
+.txn-date { font-size:12px; color:var(--text-sub); margin-top:2px; }
+.txn-actions { display:flex; gap:6px; margin-top:6px; justify-content:flex-end; }
+.positive { color:var(--green); }
+.negative { color:var(--red); }
+.empty { padding:32px 0; text-align:center; color:var(--text-sub); font-size:14px; }
+
+/* FAVOURITES */
+.favs-list { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:4px; }
+.fav-chip {
+  display:flex; align-items:center; gap:6px; padding:7px 14px;
+  border:1px solid var(--border); border-radius:20px; font-size:13px;
+  cursor:pointer; color:var(--text); background:var(--surface);
+  transition:all var(--transition);
+}
+.fav-chip:hover { border-color:var(--accent); color:var(--accent); }
+.fav-amt { font-size:12px; color:var(--text-sub); }
+
+/* DASHBOARD */
+.dashboard { display:flex; flex-direction:column; gap:0; }
+.dash-hero-row { display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-bottom:14px; }
+.hero-card { background:var(--surface); border:1px solid var(--border); border-radius:14px; padding:22px; }
+.hero-label { font-size:12px; color:var(--text-sub); font-weight:500; letter-spacing:0.3px; margin-bottom:6px; }
+.hero-amount { font-size:26px; font-weight:700; letter-spacing:-1px; color:var(--text); }
+.hero-amount.over { color:var(--red); }
+.hero-net { font-size:14px; font-weight:600; margin-top:6px; }
+.budget-bar-wrap { height:4px; background:var(--surface2); border-radius:2px; margin:10px 0 4px; overflow:hidden; }
+.budget-bar { height:100%; border-radius:2px; transition:width 0.5s ease; }
+.budget-sub { font-size:12px; color:var(--text-sub); }
+.dash-stats-row { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin-bottom:4px; }
+.stat-card { background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:14px 16px; }
+.stat-label { font-size:12px; color:var(--text-sub); margin-bottom:4px; }
+.stat-val { font-size:17px; font-weight:700; }
+.alerts-list { display:flex; flex-direction:column; gap:10px; }
+.alert-item { background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:14px; }
+.alert-row { display:flex; justify-content:space-between; margin-bottom:6px; }
+.alert-cat { font-size:14px; font-weight:500; }
+.alert-pct { font-size:14px; font-weight:700; color:var(--amber); }
+.alert-pct.over { color:var(--red); }
+.alert-sub { font-size:12px; color:var(--text-sub); margin-top:4px; }
+
+/* BAR CHART */
+.bar-chart-wrap { background:var(--surface); border:1px solid var(--border); border-radius:14px; padding:20px; }
+.bar-chart { display:flex; align-items:flex-end; gap:8px; height:140px; }
+.bar-group { flex:1; display:flex; flex-direction:column; align-items:center; gap:4px; height:100%; }
+.bars { flex:1; width:100%; display:flex; align-items:flex-end; gap:3px; position:relative; }
+.bar { flex:1; border-radius:4px 4px 0 0; transition:height 0.4s ease; min-height:2px; }
+.income-bar { background:var(--green); opacity:0.75; }
+.expense-bar { background:var(--red); opacity:0.8; }
+.expense-bar.over { background:var(--red); }
+.budget-line { position:absolute; left:0; right:0; height:2px; background:var(--accent); opacity:0.5; border-radius:1px; }
+.bar-label { font-size:11px; color:var(--text-sub); }
+.bar-legend { display:flex; align-items:center; gap:14px; margin-top:14px; font-size:12px; color:var(--text-sub); justify-content:center; }
+.legend-dot { width:10px; height:10px; border-radius:50%; display:inline-block; margin-right:4px; }
+.income-dot { background:var(--green); }
+.expense-dot { background:var(--red); }
+
+/* DONUT */
+.donut-wrap { display:flex; align-items:flex-start; gap:24px; flex-wrap:wrap; margin:4px 0; }
+.donut-legend { display:flex; flex-direction:column; gap:8px; flex:1; min-width:160px; }
+.legend-row { display:flex; align-items:center; gap:8px; font-size:13px; }
+.legend-color { width:10px; height:10px; border-radius:50%; flex-shrink:0; }
+.legend-cat { flex:1; color:var(--text); }
+.legend-pct { color:var(--text-sub); min-width:36px; text-align:right; }
+.legend-amt { color:var(--text); font-weight:600; min-width:80px; text-align:right; }
+.donut-center-label { font-size:11px; fill:var(--text-sub,#888); font-family:-apple-system,sans-serif; }
+.donut-center-val { font-size:13px; font-weight:700; fill:var(--text,#1a1a1a); font-family:-apple-system,sans-serif; }
+
+/* ANALYTICS */
+.analytics-summary-row { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin-bottom:4px; }
+.ana-budget-bar-wrap { height:8px; background:var(--surface2); border-radius:4px; overflow:hidden; margin-bottom:4px; }
+.ana-budget-bar { height:100%; background:var(--green); border-radius:4px; transition:width 0.4s; }
+.ana-budget-bar.over { background:var(--red); }
+.ana-budget-label { font-size:13px; color:var(--text-sub); }
+.cat-bars { display:flex; flex-direction:column; gap:10px; margin-bottom:16px; }
+.cat-bar-row { display:flex; align-items:center; gap:10px; }
+.cat-bar-label { font-size:13px; color:var(--text); min-width:120px; }
+.cat-bar-track { flex:1; height:8px; background:var(--surface2); border-radius:4px; overflow:hidden; }
+.cat-bar-fill { height:100%; border-radius:4px; background:var(--accent); opacity:0.85; transition:width 0.4s; }
+.cat-bar-fill.warn { background:var(--amber); }
+.cat-bar-fill.over { background:var(--red); }
+.cat-bar-amt { font-size:13px; font-weight:600; color:var(--text); min-width:90px; text-align:right; }
+
+/* SUMMARY */
+.summary-list { display:flex; flex-direction:column; gap:12px; }
+.summary-card { background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:18px; }
+.summary-month { font-size:15px; font-weight:600; margin-bottom:10px; }
+.summary-stats { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; }
+.summary-stats div { display:flex; flex-direction:column; gap:3px; }
+.summary-label { font-size:12px; color:var(--text-sub); }
+
+/* SETTINGS */
+.settings-section { background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:18px; margin-bottom:12px; }
+.settings-label { font-size:12px; font-weight:600; letter-spacing:0.5px; text-transform:uppercase; color:var(--text-sub); margin-bottom:12px; }
+.tag-list { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:10px; }
+.tag-item { display:flex; align-items:center; gap:4px; padding:5px 10px; background:var(--surface2); border:1px solid var(--border); border-radius:6px; font-size:13px; }
+.tag-remove { color:var(--text-sub); font-size:15px; line-height:1; padding:0 0 0 4px; }
+.tag-remove:hover { color:var(--red); }
+.rec-item { display:flex; justify-content:space-between; align-items:center; padding:10px 0; border-bottom:1px solid var(--border); font-size:14px; gap:10px; }
+.rec-item:last-of-type { border-bottom:none; }
+.rec-actions { display:flex; gap:6px; align-items:center; }
+.rec-done { font-size:12px; color:var(--green); }
+.account-info { font-size:14px; color:var(--text-sub); margin-bottom:12px; word-break:break-all; }
+
+/* TOAST */
+.toast { position:fixed; bottom:90px; left:50%; transform:translateX(-50%) translateY(16px); background:var(--text); color:var(--bg); padding:10px 20px; border-radius:20px; font-size:13px; font-weight:500; opacity:0; transition:all 0.25s ease; pointer-events:none; z-index:9999; white-space:nowrap; }
+.toast.show { opacity:1; transform:translateX(-50%) translateY(0); }
+.toast.error { background:var(--red); color:#fff; }
+
+/* CONFIRM */
+#confirm-overlay { position:fixed; inset:0; background:rgba(0,0,0,0.5); display:none; align-items:center; justify-content:center; z-index:9998; padding:24px; }
+.confirm-box { background:var(--surface); border:1px solid var(--border); border-radius:14px; padding:28px; max-width:320px; width:100%; }
+#confirm-msg { font-size:15px; margin-bottom:20px; }
+.confirm-actions { display:flex; gap:10px; justify-content:flex-end; }
+.user-email-display { display:none; }
+.theme-btn { padding:7px 14px; border:1px solid rgba(255,255,255,0.15); border-radius:8px; color:rgba(255,255,255,0.7); font-size:12px; margin:0 16px 12px; display:block; width:calc(100% - 32px); text-align:left; transition:all var(--transition); }
+.theme-btn:hover { border-color:rgba(255,255,255,0.35); color:#fff; }
+
+/* ── RESPONSIVE ───────────────────────────────── */
+@media (max-width: 768px) {
+  .sidebar { display:none; }
+  .main-content { margin-left:0; padding:20px 16px 90px; }
+  .bottom-nav {
+    display:flex; position:fixed; bottom:0; left:0; right:0;
+    background:var(--nav-bg); backdrop-filter:blur(20px) saturate(180%);
+    -webkit-backdrop-filter:blur(20px) saturate(180%);
+    border-top:1px solid var(--border); z-index:100; padding-bottom:env(safe-area-inset-bottom);
+  }
+  .bottom-nav .nav-item {
+    flex:1; flex-direction:column; padding:10px 4px;
+    font-size:10px; gap:3px; justify-content:center; align-items:center;
+    color:var(--text-sub); border-radius:0;
+  }
+  .bottom-nav .nav-item.active { color:var(--accent); background:none; }
+  .bottom-nav .nav-item.active::before { display:none; }
+  .dash-hero-row { grid-template-columns:1fr; }
+  .dash-stats-row { grid-template-columns:1fr 1fr; }
+  .analytics-summary-row { grid-template-columns:1fr 1fr; }
+  .summary-stats { grid-template-columns:1fr 1fr; }
+  .cat-bar-label { min-width:80px; }
+  .toast { bottom:calc(70px + env(safe-area-inset-bottom)); }
+  .hero-amount { font-size:22px; }
+  .form-row { flex-direction:column; gap:8px; }
+}
+</style>
+</head>
+<body>
+<div id="toast" class="toast"></div>
+<div id="confirm-overlay">
+  <div class="confirm-box">
+    <div id="confirm-msg"></div>
+    <div class="confirm-actions">
+      <button class="btn-ghost" id="confirm-cancel">Cancel</button>
+      <button class="btn-primary" id="confirm-ok" style="width:auto;padding:9px 20px">Confirm</button>
+    </div>
+  </div>
+</div>
+
+<!-- AUTH -->
+<div id="auth-screen" style="display:flex">
+  <div class="auth-card">
+    <div class="auth-logo">Finora</div>
+    <div class="auth-tagline">Your office finance, simplified.</div>
+    <div class="auth-tabs">
+      <button class="auth-tab-btn active" data-tab="signin" onclick="switchAuthTab('signin')">Sign In</button>
+      <button class="auth-tab-btn" data-tab="register" onclick="switchAuthTab('register')">Register</button>
+    </div>
+
+    <div id="auth-signin">
+      <div class="form-group"><label>Email</label><input class="input" id="si-email" type="email" placeholder="you@example.com" /></div>
+      <div class="form-group"><label>Password</label><input class="input" id="si-pass" type="password" placeholder="••••••••" /></div>
+      <div id="si-error" class="auth-error"></div>
+      <button class="btn-primary" onclick="handleSignIn()" style="margin-top:4px">Sign In</button>
+      <button class="auth-forgot" onclick="handleForgotPassword()">Forgot password?</button>
+      <div class="auth-divider">or</div>
+      <button class="btn-google" onclick="handleGoogleSignIn()">Continue with Google</button>
+    </div>
+
+    <div id="auth-register" style="display:none">
+      <div class="form-group"><label>Email</label><input class="input" id="reg-email" type="email" placeholder="you@example.com" /></div>
+      <div class="form-group"><label>Password</label><input class="input" id="reg-pass" type="password" placeholder="Min. 6 characters" /></div>
+      <div class="form-group"><label>Confirm Password</label><input class="input" id="reg-confirm" type="password" placeholder="Repeat password" /></div>
+      <div id="reg-error" class="auth-error"></div>
+      <button class="btn-primary" onclick="handleRegister()" style="margin-top:4px">Create Account</button>
+    </div>
+  </div>
+</div>
+
+<!-- APP -->
+<div id="app" style="display:none">
+  <!-- Sidebar -->
+  <aside class="sidebar">
+    <div class="sidebar-brand">
+      <div class="sidebar-logo">Finora</div>
+      <div class="sidebar-sub">Office Finance</div>
+    </div>
+    <nav class="sidebar-nav">
+      <button class="nav-item active" data-tab="dashboard" onclick="switchTab('dashboard')">Dashboard</button>
+      <button class="nav-item" data-tab="expenses" onclick="switchTab('expenses')">Expenses</button>
+      <button class="nav-item" data-tab="income" onclick="switchTab('income')">Income</button>
+      <button class="nav-item" data-tab="analytics" onclick="switchTab('analytics')">Analytics</button>
+      <button class="nav-item" data-tab="summary" onclick="switchTab('summary')">Summary</button>
+      <button class="nav-item" data-tab="settings" onclick="switchTab('settings')">Settings</button>
+    </nav>
+    <button class="theme-btn" id="theme-toggle" onclick="toggleTheme()">Dark Mode</button>
+    <div class="sidebar-user" id="user-email"></div>
+  </aside>
+
+  <!-- Main -->
+  <main class="main-content">
+    <div id="tab-content"></div>
+  </main>
+
+  <!-- Bottom Nav (mobile) -->
+  <nav class="bottom-nav">
+    <button class="nav-item active" data-tab="dashboard" onclick="switchTab('dashboard')">Dashboard</button>
+    <button class="nav-item" data-tab="expenses" onclick="switchTab('expenses')">Expenses</button>
+    <button class="nav-item" data-tab="income" onclick="switchTab('income')">Income</button>
+    <button class="nav-item" data-tab="analytics" onclick="switchTab('analytics')">Analytics</button>
+    <button class="nav-item" data-tab="summary" onclick="switchTab('summary')">Summary</button>
+    <button class="nav-item" data-tab="settings" onclick="switchTab('settings')">Settings</button>
+  </nav>
+</div>
+
+<script>
+function switchAuthTab(tab) {
+  document.getElementById("auth-signin").style.display = tab==="signin"?"block":"none";
+  document.getElementById("auth-register").style.display = tab==="register"?"block":"none";
+  document.querySelectorAll(".auth-tab-btn").forEach(b=>b.classList.toggle("active",b.dataset.tab===tab));
+}
+</script>
+</body>
+</html>
